@@ -16,19 +16,19 @@ from xml.etree import ElementTree as ET
 
 
 def get_media_id(url: str) -> str | None:
-    """Extracts the unique Instagram media shortcode (ID) from reels, posts, or TV URLs."""
-    # Regular expression pattern to capture the alphanumeric media shortcode after /reel/, /p/, or /tv/
+    """Extracts the unique Instagram shortcode from reels, posts, or TV URLs."""
+    # Regular expression pattern to match alphanumeric ID after /reel/, /p/, or /tv/
     match = re.search(r"/(?:reel|p|tv)/([A-Za-z0-9_-]+)", url)
-    # Return the matched group 1 (the shortcode) if a match is found, otherwise return None
+    # Return the extracted ID string if a match is found, otherwise return None
     return match.group(1) if match else None
 
 
 def fetch_payload(media_id: str) -> str:
-    """Sends a POST request to Instagram's internal route definition endpoint to fetch media metadata."""
-    # Instagram internal ajax route definition endpoint used to fetch preloader data chunks
+    """Sends a POST request to Instagram's internal endpoint to fetch media data."""
+    # Target internal Instagram route-definition endpoint URL
     url = "https://www.instagram.com/ajax/route-definition/"
     
-    # Custom headers imitating a mobile Android app browser to prevent immediate blocking/rate-limiting
+    # Headers mimicking an official mobile Android client to prevent rate limits/blocks
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 16; 2406ERN9CI) AppleWebKit/537.36",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -37,7 +37,7 @@ def fetch_payload(media_id: str) -> str:
         "referer": "https://www.instagram.com/",
     }
     
-    # Form data payload required by Instagram's internal routing system for the specific media ID
+    # URL-encoded payload containing routing parameters and the targeted media shortcode
     data = urlencode({
         "route_url": f"/reel/{media_id}/?l=1",
         "__a": 1,
@@ -45,20 +45,20 @@ def fetch_payload(media_id: str) -> str:
         "lsd": "AdQ8qJYZezadBOYUt1mu-DRKm1I",
     }).encode()
     
-    # Construct the HTTP POST request object with target URL, payload bytes, headers, and method
+    # Create the HTTP request object with POST method and custom headers/data
     req = Request(url, data=data, headers=headers, method="POST")
     
-    # Open the HTTP connection and read/decode the response payload text string
+    # Open the connection, execute the request, and decode response bytes into a string
     with urlopen(req) as resp:
         return resp.read().decode()
 
 
 def parse_payload(data: str) -> dict:
-    """Parses Instagram's multi-part streaming JSON payload and extracts media details."""
-    # Instagram returns chunked javascript/JSON data separated by the multi-part delimiter string
+    """Filters, cleans, and structures raw chunks into neat dictionary formats."""
+    # Instagram delivers data as chunked multi-part payloads separated by 'for (;;);'
     parts = data.split("for (;;);")
     
-    # Initialize the structured dictionary template for final output data
+    # Initialize the base response dictionary structure
     out = {
         "post_info": {},
         "video_links": [],
@@ -67,20 +67,20 @@ def parse_payload(data: str) -> dict:
         "audio_info": {},
     }
 
-    # Iterate through each split part to locate the chunk containing the preloader data object
+    # Loop through each individual chunk part to locate media payload blocks
     for p in parts:
         try:
-            # Safely parse text chunk into a Python dictionary object
+            # Attempt to convert each text chunk safely into a Python dictionary
             obj = json.loads(p.strip())
         except (json.JSONDecodeError, TypeError):
             # Skip chunks that aren't valid JSON syntax
             continue
             
-        # Filter chunks to target only the 'preloader' type payload containing media stats
+        # Target specifically the chunk type labeled as 'preloader'
         if obj.get("__type") != "preloader":
             continue
 
-        # Navigate deeply nested dictionary keys to locate public media metadata nodes safely
+        # Drill down deep nested JSON keys to extract public media metadata nodes
         m = (
             obj.get("result", {})
             .get("result", {})
@@ -89,7 +89,7 @@ def parse_payload(data: str) -> dict:
             .get("if_not_gated_logged_out", {})
         )
 
-        # Extract basic general post metrics and information via dictionary comprehension
+        # Extract primary post metrics (likes, dimensions, code, etc.)
         out["post_info"].update({
             k: m.get(k)
             for k in (
@@ -102,10 +102,10 @@ def parse_payload(data: str) -> dict:
                 "has_audio",
             )
         })
-        # Extract post text caption safely with fallback to empty dict
+        # Extract post text description safely
         out["post_info"]["caption"] = (m.get("caption") or {}).get("text")
         
-        # Extract uploader user profile details (username, internal user ID, avatar url)
+        # Extract creator profile details (username, internal user ID, profile picture)
         u = m.get("user", {})
         out["post_info"].update({
             "username": u.get("username"),
@@ -113,44 +113,54 @@ def parse_payload(data: str) -> dict:
             "profile_pic_url": u.get("profile_pic_url"),
         })
         
-        # Map available progressive direct download video links
-        out["video_links"] = [
-            {"type": v.get("type"), "url": v.get("url")}
-            for v in m.get("video_versions", [])
-        ]
+        # Extract progressive direct download links and translate heights into quality tags (e.g., '720p')
+        video_versions = m.get("video_versions", [])
+        formatted_videos = []
+        for v in video_versions:
+            height = v.get("height")
+            width = v.get("width")
+            quality_label = f"{height}p" if height else "HD"
+            
+            formatted_videos.append({
+                "quality": quality_label,
+                "width": width,
+                "height": height,
+                "url": v.get("url")
+            })
+        out["video_links"] = formatted_videos
         
-        # Map available image thumbnail resolution variants
+        # Map available thumbnail variants for preview images
         out["thumbnails"] = [
             {"width": c.get("width"), "height": c.get("height"), "url": c.get("url")}
             for c in m.get("image_versions2", {}).get("candidates", [])
         ]
         
-        # Map related content topics/pills associated with the post
+        # Map hashtags or topic category tags associated with the reel
         out["post_info"]["topics"] = [
             t.get("topic_name")
             for t in m.get("related_topic_pills", [])
             if t.get("topic_name")
         ]
 
-        # Extract DASH manifest string used for adaptive video streaming qualities
+        # Extract DASH streaming XML manifest string if available
         manifest = m.get("video_dash_manifest")
         if not manifest:
             continue
 
-        # Use regex to find total video duration time in seconds from manifest attributes
+        # Extract total video playback duration in seconds using regex matching
         if d := re.search(r'mediaPresentationDuration="PT([\d.]+)S"', manifest):
             out["post_info"]["duration"] = float(d.group(1))
 
         try:
-            # XML Namespace dictionary required to parse MPEG-DASH XML manifests accurately
+            # Define XML namespace schema configuration for MPEG-DASH parsing
             ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
             
-            # Parse XML manifest string and find all media stream representation nodes
+            # Parse XML manifest elements to extract separate audio and high-res video streams
             for rep in ET.fromstring(manifest).findall(".//mpd:Representation", ns):
                 dash_url = rep.findtext("mpd:BaseURL", namespaces=ns)
                 mime_type = rep.get("mimeType") or ""
                 
-                # Filter representation nodes belonging to audio data streams
+                # Check if the stream element contains audio information
                 if "audio" in mime_type:
                     out["audio_info"] = {
                         "bandwidth_bps": int(rep.get("bandwidth") or 0) or None,
@@ -158,89 +168,83 @@ def parse_payload(data: str) -> dict:
                         "sample_rate": rep.get("audioSamplingRate"),
                         "url": dash_url,
                     }
-                # Filter representation nodes belonging to high-resolution video data streams
+                # Check if the stream element contains high-resolution video formats
                 elif dash_url and "video" in mime_type:
+                    rep_height = rep.get("height")
+                    q_label = rep.get("FBQualityLabel") or (f"{rep_height}p" if rep_height else "HD")
                     out["dash_qualities"].append({
+                        "quality": q_label,
                         "bandwidth_bps": int(rep.get("bandwidth") or 0) or None,
                         "width": int(rep.get("width") or 0) or None,
                         "height": int(rep.get("height") or 0) or None,
                         "mime_type": mime_type,
                         "codecs": rep.get("codecs"),
-                        "quality_label": rep.get("FBQualityLabel"),
                         "url": dash_url,
                     })
         except ET.ParseError:
-            # Fallback error mapping if XML data structure formatting fails
+            # Fallback error mapping if XML parsing fails completely
             out["dash_qualities"] = [{"error": "Failed to parse XML manifest"}]
 
     return out
 
 
 def load_valid_keys() -> list[str]:
-    """Safely loads allowed API keys from the 'api_keys.txt' flat file using absolute paths."""
+    """Reads the 'api_keys.txt' configuration file securely using absolute paths."""
     try:
-        # Determine the absolute system directory path where this current Python script file resides
+        # Resolve the absolute path of the current directory and find root folder
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        # Navigate one directory level up to locate the root repository directory
         root_dir = os.path.dirname(current_dir)
-        # Join root path with the target configuration text filename
         keys_path = os.path.join(root_dir, "api_keys.txt")
         
-        # Open and read file line-by-line, stripping whitespace and filtering out empty lines
+        # Open file and parse each line into a clean list of allowed keys
         with open(keys_path, "r", encoding="utf-8") as f:
             return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        # Return an empty list gracefully if the key file is missing on the server
+        # Return an empty list if configuration file is missing
         return []
 
 
 class handler(BaseHTTPRequestHandler):
-    """Vercel Serverless HTTP Request Handler class for processing inbound API query endpoints."""
+    """Manages incoming URL requests, checks authentication, and returns JSON."""
 
     def _send_json_response(self, status_code: int, payload: dict):
-        """Helper method to construct standard HTTP headers and write serialized JSON responses back."""
+        """Helper method to construct HTTP headers and write JSON payloads back."""
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
         self.wfile.write(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
 
     def do_GET(self):
-        """Handles incoming HTTP GET requests, parses parameters, checks security keys, and returns data."""
-        # Parse full URL string into URL-component pieces
+        """Handles incoming HTTP GET requests, extracts parameters, validates access, and outputs data."""
+        # Parse the requested endpoint path and separate URL query variables
         parsed_path = urlparse(self.path)
-        # Extract dictionary mapping of URL query string parameters
         query_params = parse_qs(parsed_path.query)
 
-        # Extract target parameters ('key' for authentication, 'url' for target content link)
+        # Extract 'key' (API authentication) and 'url' (Instagram target link) parameters
         api_key = query_params.get("key", [None])[0]
         insta_url = query_params.get("url", [None])[0]
 
-        # Step 1: Validate API Key authentication against loaded keys list
+        # Step 1: Authenticate the provided API key against allowed keys list
         valid_keys = load_valid_keys()
         if not api_key or api_key not in valid_keys:
-            # Return HTTP 401 Unauthorized status if key verification fails
             self._send_json_response(401, {"error": "Unauthorized: Invalid or missing API key"})
             return
 
-        # Step 2: Validate the presence of the Instagram target URL query parameter
+        # Step 2: Validate whether the target Instagram URL parameter was provided
         if not insta_url:
-            # Return HTTP 400 Bad Request status if query variable is absent
             self._send_json_response(400, {"error": "Bad Request: Missing 'url' parameter"})
             return
 
-        # Step 3: Extract and validate the core media shortcode ID from the link string
+        # Step 3: Extract and validate media shortcode ID from the link
         media_id = get_media_id(insta_url)
         if not media_id:
-            # Return HTTP 400 Bad Request status if shortcode pattern cannot be parsed
             self._send_json_response(400, {"error": "Bad Request: Invalid Instagram URL format"})
             return
 
-        # Step 4: Execute fetch and parse workflow to retrieve target payload data
+        # Step 4: Execute fetch and parse routines and send final JSON response to client
         try:
             raw_payload = fetch_payload(media_id)
             result = parse_payload(raw_payload)
-            # Return HTTP 200 OK status along with structured JSON output data
             self._send_json_response(200, result)
         except Exception as exc:
-            # Return HTTP 500 status block if network failures or parser exceptions occur unexpectedly
             self._send_json_response(500, {"error": f"Internal Server Error: {str(exc)}"})
