@@ -1,8 +1,8 @@
 """
-Instagram Media Downloader API (Full 1080p & Audio Fix)
--------------------------------------------------------
-Optimized implementation to extract true 1080p video streams alongside
-their respective audio streams from Instagram's DASH manifests.
+Instagram Media Downloader API (Direct Progressive MP4 & Audio Stream Resolver)
+--------------------------------------------------------------------------
+Forces extraction of direct high-resolution non-DASH progressive MP4 files 
+(supporting up to 1080p) alongside the independent audio track.
 """
 
 from http.server import BaseHTTPRequestHandler
@@ -103,12 +103,12 @@ def parse_payload(data: str) -> dict:
             if t.get("topic_name")
         ]
 
-        # Check alternative direct video fields if DASH is absent or restricted
+        # 1. Collect direct progressive video streams (typically contains full 1080p MP4 files)
         video_versions = m.get("video_versions", [])
         direct_videos = []
         for vv in video_versions:
-            v_height = vv.get("height")
-            v_width = vv.get("width")
+            v_height = vv.get("height", 0)
+            v_width = vv.get("width", 0)
             direct_videos.append({
                 "quality": f"{v_height}p" if v_height else "HD",
                 "bandwidth_bps": vv.get("bandwidth", 0),
@@ -119,57 +119,57 @@ def parse_payload(data: str) -> dict:
                 "url": vv.get("url")
             })
 
+        # 2. Parse DASH manifest for alternative highest-res video tracks or fallback audio tracks
         manifest = m.get("video_dash_manifest")
+        dash_videos = []
+        audio_candidates = []
+
         if manifest:
             if d := re.search(r'mediaPresentationDuration="PT([\d.]+)S"', manifest):
                 out["post_info"]["duration"] = float(d.group(1))
 
             try:
                 ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
-                video_candidates = list(direct_videos)  # Fallback/merge direct options
-                audio_candidates = []
-                
                 for rep in ET.fromstring(manifest).findall(".//mpd:Representation", ns):
                     dash_url = rep.findtext("mpd:BaseURL", namespaces=ns)
                     mime_type = rep.get("mimeType") or ""
+                    codecs = rep.get("codecs") or ""
                     
                     if not dash_url:
                         continue
 
-                    if "audio" in mime_type or "mp4a" in (rep.get("codecs") or ""):
+                    if "audio" in mime_type or "mp4a" in codecs:
                         audio_candidates.append({
                             "bandwidth_bps": int(rep.get("bandwidth") or 0),
-                            "codecs": rep.get("codecs"),
+                            "codecs": codecs,
                             "sample_rate": rep.get("audioSamplingRate"),
                             "url": dash_url,
                         })
-                    elif "video" in mime_type or "avc1" in (rep.get("codecs") or ""):
+                    elif "video" in mime_type or "avc1" in codecs:
                         rep_height = int(rep.get("height") or 0)
                         rep_width = int(rep.get("width") or 0)
-                        video_candidates.append({
+                        dash_videos.append({
                             "quality": f"{rep_height}p" if rep_height else "HD",
                             "bandwidth_bps": int(rep.get("bandwidth") or 0),
                             "width": rep_width or None,
                             "height": rep_height or None,
                             "mime_type": mime_type,
-                            "codecs": rep.get("codecs"),
+                            "codecs": codecs,
                             "url": dash_url,
                         })
-                
-                if video_candidates:
-                    # Explicitly target maximum height (1080p, 720p, etc.)
-                    best_video = max(video_candidates, key=lambda x: (x["height"] or 0, x["bandwidth_bps"]))
-                    out["video"] = best_video
-
-                if audio_candidates:
-                    best_audio = max(audio_candidates, key=lambda x: x["bandwidth_bps"])
-                    out["audio"] = best_audio
-
             except ET.ParseError:
-                if direct_videos:
-                    out["video"] = max(direct_videos, key=lambda x: x["height"] or 0)
-        elif direct_videos:
-            out["video"] = max(direct_videos, key=lambda x: x["height"] or 0)
+                pass
+
+        # Combine both progressive video sources and DASH streams to find the absolute max resolution (1080p+)
+        all_video_options = direct_videos + dash_videos
+        if all_video_options:
+            best_video = max(all_video_options, key=lambda x: (x["height"] or 0, x["bandwidth_bps"]))
+            out["video"] = best_video
+
+        # Select highest quality audio stream track
+        if audio_candidates:
+            best_audio = max(audio_candidates, key=lambda x: x["bandwidth_bps"])
+            out["audio"] = best_audio
 
     return out
 
