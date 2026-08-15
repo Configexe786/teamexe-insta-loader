@@ -1,9 +1,8 @@
 """
-Instagram Media Downloader API (Optimized 1080p & Audio Fix)
-------------------------------------------------------------
-Serverless Vercel-compatible Python API that parses Instagram reels/posts,
-extracts the highest available 1080p (or maximum) video stream, and maps 
-the dedicated audio stream track.
+Instagram Media Downloader API (Full 1080p & Audio Fix)
+-------------------------------------------------------
+Optimized implementation to extract true 1080p video streams alongside
+their respective audio streams from Instagram's DASH manifests.
 """
 
 from http.server import BaseHTTPRequestHandler
@@ -16,18 +15,14 @@ from xml.etree import ElementTree as ET
 
 
 def get_media_id(url: str) -> str | None:
-    """Extracts the unique Instagram shortcode from reels, posts, or TV URLs."""
     match = re.search(r"/(?:reel|p|tv)/([A-Za-z0-9_-]+)", url)
     return match.group(1) if match else None
 
 
 def fetch_payload(media_id: str) -> str:
-    """Sends a POST request to Instagram's internal endpoint to fetch media data."""
     url = "https://www.instagram.com/ajax/route-definition/"
-    
-    # Headers mimicking an official mobile Android client to prevent rate limits/blocks
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 16; 2406ERN9CI) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 330.0.0.0.0 (iPhone14,3; iOS 17_5; en_US; en; scale=3.00; 1170x2532; 578508101)",
         "Content-Type": "application/x-www-form-urlencoded",
         "x-fb-lsd": "AdQ8qJYZezadBOYUt1mu-DRKm1I",
         "origin": "https://www.instagram.com",
@@ -47,7 +42,6 @@ def fetch_payload(media_id: str) -> str:
 
 
 def parse_payload(data: str) -> dict:
-    """Filters chunks and extracts 1080p+ video and valid audio tracks from DASH XML."""
     parts = data.split("for (;;);")
     
     out = {
@@ -74,7 +68,9 @@ def parse_payload(data: str) -> dict:
             .get("if_not_gated_logged_out", {})
         )
 
-        # Extract primary post metrics
+        if not m:
+            continue
+
         out["post_info"].update({
             k: m.get(k)
             for k in (
@@ -107,65 +103,78 @@ def parse_payload(data: str) -> dict:
             if t.get("topic_name")
         ]
 
+        # Check alternative direct video fields if DASH is absent or restricted
+        video_versions = m.get("video_versions", [])
+        direct_videos = []
+        for vv in video_versions:
+            v_height = vv.get("height")
+            v_width = vv.get("width")
+            direct_videos.append({
+                "quality": f"{v_height}p" if v_height else "HD",
+                "bandwidth_bps": vv.get("bandwidth", 0),
+                "width": v_width,
+                "height": v_height,
+                "mime_type": "video/mp4",
+                "codecs": "avc1.64001f",
+                "url": vv.get("url")
+            })
+
         manifest = m.get("video_dash_manifest")
-        if not manifest:
-            continue
+        if manifest:
+            if d := re.search(r'mediaPresentationDuration="PT([\d.]+)S"', manifest):
+                out["post_info"]["duration"] = float(d.group(1))
 
-        if d := re.search(r'mediaPresentationDuration="PT([\d.]+)S"', manifest):
-            out["post_info"]["duration"] = float(d.group(1))
-
-        try:
-            ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
-            video_candidates = []
-            audio_candidates = []
-            
-            for rep in ET.fromstring(manifest).findall(".//mpd:Representation", ns):
-                dash_url = rep.findtext("mpd:BaseURL", namespaces=ns)
-                mime_type = rep.get("mimeType") or ""
+            try:
+                ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
+                video_candidates = list(direct_videos)  # Fallback/merge direct options
+                audio_candidates = []
                 
-                if not dash_url:
-                    continue
+                for rep in ET.fromstring(manifest).findall(".//mpd:Representation", ns):
+                    dash_url = rep.findtext("mpd:BaseURL", namespaces=ns)
+                    mime_type = rep.get("mimeType") or ""
+                    
+                    if not dash_url:
+                        continue
 
-                # Handle audio components
-                if "audio" in mime_type:
-                    audio_candidates.append({
-                        "bandwidth_bps": int(rep.get("bandwidth") or 0),
-                        "codecs": rep.get("codecs"),
-                        "sample_rate": rep.get("audioSamplingRate"),
-                        "url": dash_url,
-                    })
-                # Handle video components (capturing 720p, 1080p, etc.)
-                elif "video" in mime_type:
-                    rep_height = int(rep.get("height") or 0)
-                    rep_width = int(rep.get("width") or 0)
-                    video_candidates.append({
-                        "quality": f"{rep_height}p" if rep_height else "HD",
-                        "bandwidth_bps": int(rep.get("bandwidth") or 0),
-                        "width": rep_width or None,
-                        "height": rep_height or None,
-                        "mime_type": mime_type,
-                        "codecs": rep.get("codecs"),
-                        "url": dash_url,
-                    })
-            
-            # Select the absolute highest resolution / bandwidth available (prioritizing 1080p+)
-            if video_candidates:
-                best_video = max(video_candidates, key=lambda x: (x["height"] or 0, x["bandwidth_bps"]))
-                out["video"] = best_video
+                    if "audio" in mime_type or "mp4a" in (rep.get("codecs") or ""):
+                        audio_candidates.append({
+                            "bandwidth_bps": int(rep.get("bandwidth") or 0),
+                            "codecs": rep.get("codecs"),
+                            "sample_rate": rep.get("audioSamplingRate"),
+                            "url": dash_url,
+                        })
+                    elif "video" in mime_type or "avc1" in (rep.get("codecs") or ""):
+                        rep_height = int(rep.get("height") or 0)
+                        rep_width = int(rep.get("width") or 0)
+                        video_candidates.append({
+                            "quality": f"{rep_height}p" if rep_height else "HD",
+                            "bandwidth_bps": int(rep.get("bandwidth") or 0),
+                            "width": rep_width or None,
+                            "height": rep_height or None,
+                            "mime_type": mime_type,
+                            "codecs": rep.get("codecs"),
+                            "url": dash_url,
+                        })
+                
+                if video_candidates:
+                    # Explicitly target maximum height (1080p, 720p, etc.)
+                    best_video = max(video_candidates, key=lambda x: (x["height"] or 0, x["bandwidth_bps"]))
+                    out["video"] = best_video
 
-            # Select the highest quality audio track available
-            if audio_candidates:
-                best_audio = max(audio_candidates, key=lambda x: x["bandwidth_bps"])
-                out["audio"] = best_audio
+                if audio_candidates:
+                    best_audio = max(audio_candidates, key=lambda x: x["bandwidth_bps"])
+                    out["audio"] = best_audio
 
-        except ET.ParseError:
-            out["video"] = {"error": "Failed to parse XML manifest"}
+            except ET.ParseError:
+                if direct_videos:
+                    out["video"] = max(direct_videos, key=lambda x: x["height"] or 0)
+        elif direct_videos:
+            out["video"] = max(direct_videos, key=lambda x: x["height"] or 0)
 
     return out
 
 
 def load_valid_keys() -> list[str]:
-    """Reads the 'api_keys.txt' configuration file securely using absolute paths."""
     try:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         root_dir = os.path.dirname(current_dir)
@@ -178,8 +187,6 @@ def load_valid_keys() -> list[str]:
 
 
 class handler(BaseHTTPRequestHandler):
-    """Manages incoming URL requests, checks authentication, and returns JSON."""
-
     def _send_json_response(self, status_code: int, payload: dict):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
