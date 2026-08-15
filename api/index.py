@@ -1,8 +1,8 @@
 """
-Instagram Media Downloader API
------------------------------
+Instagram Media Downloader API (Optimized Clean Output)
+-------------------------------------------------------
 A serverless Vercel-compatible Python API that parses Instagram post/reel data 
-and returns structured JSON info including video links, DASH qualities, and audio specs.
+and returns a clean, direct response containing only the top video and audio links.
 Protected by a flat-file API key authentication system.
 """
 
@@ -54,17 +54,16 @@ def fetch_payload(media_id: str) -> str:
 
 
 def parse_payload(data: str) -> dict:
-    """Filters, cleans, and structures raw chunks into neat dictionary formats."""
+    """Filters and structures raw chunks, returning only essential post info, top video, and audio."""
     # Instagram delivers data as chunked multi-part payloads separated by 'for (;;);'
     parts = data.split("for (;;);")
     
-    # Initialize the base response dictionary structure
+    # Initialize the clean base response dictionary structure
     out = {
         "post_info": {},
-        "video_links": [],
-        "dash_qualities": [],
+        "video": {},
+        "audio": {},
         "thumbnails": [],
-        "audio_info": {},
     }
 
     # Loop through each individual chunk part to locate media payload blocks
@@ -112,23 +111,7 @@ def parse_payload(data: str) -> dict:
             "user_id": u.get("id"),
             "profile_pic_url": u.get("profile_pic_url"),
         })
-        
-        # Extract progressive direct download links and translate heights into quality tags (e.g., '720p')
-        video_versions = m.get("video_versions", [])
-        formatted_videos = []
-        for v in video_versions:
-            height = v.get("height")
-            width = v.get("width")
-            quality_label = f"{height}p" if height else "HD"
-            
-            formatted_videos.append({
-                "quality": quality_label,
-                "width": width,
-                "height": height,
-                "url": v.get("url")
-            })
-        out["video_links"] = formatted_videos
-        
+
         # Map available thumbnail variants for preview images
         out["thumbnails"] = [
             {"width": c.get("width"), "height": c.get("height"), "url": c.get("url")}
@@ -142,7 +125,7 @@ def parse_payload(data: str) -> dict:
             if t.get("topic_name")
         ]
 
-        # Extract DASH streaming XML manifest string if available
+        # Extract DASH streaming XML manifest string if available to parse precise quality streams
         manifest = m.get("video_dash_manifest")
         if not manifest:
             continue
@@ -155,14 +138,16 @@ def parse_payload(data: str) -> dict:
             # Define XML namespace schema configuration for MPEG-DASH parsing
             ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
             
+            video_candidates = []
+            
             # Parse XML manifest elements to extract separate audio and high-res video streams
             for rep in ET.fromstring(manifest).findall(".//mpd:Representation", ns):
                 dash_url = rep.findtext("mpd:BaseURL", namespaces=ns)
                 mime_type = rep.get("mimeType") or ""
                 
                 # Check if the stream element contains audio information
-                if "audio" in mime_type:
-                    out["audio_info"] = {
+                if "audio" in mime_type and not out["audio"]:
+                    out["audio"] = {
                         "bandwidth_bps": int(rep.get("bandwidth") or 0) or None,
                         "codecs": rep.get("codecs"),
                         "sample_rate": rep.get("audioSamplingRate"),
@@ -170,20 +155,25 @@ def parse_payload(data: str) -> dict:
                     }
                 # Check if the stream element contains high-resolution video formats
                 elif dash_url and "video" in mime_type:
-                    rep_height = rep.get("height")
-                    q_label = rep.get("FBQualityLabel") or (f"{rep_height}p" if rep_height else "HD")
-                    out["dash_qualities"].append({
-                        "quality": q_label,
-                        "bandwidth_bps": int(rep.get("bandwidth") or 0) or None,
+                    rep_height = int(rep.get("height") or 0)
+                    video_candidates.append({
+                        "quality": f"{rep_height}p" if rep_height else "HD",
+                        "bandwidth_bps": int(rep.get("bandwidth") or 0) or 0,
                         "width": int(rep.get("width") or 0) or None,
-                        "height": int(rep.get("height") or 0) or None,
+                        "height": rep_height or None,
                         "mime_type": mime_type,
                         "codecs": rep.get("codecs"),
                         "url": dash_url,
                     })
+            
+            # Select only the highest quality video option available based on bandwidth/resolution
+            if video_candidates:
+                best_video = max(video_candidates, key=lambda x: x["bandwidth_bps"])
+                out["video"] = best_video
+
         except ET.ParseError:
             # Fallback error mapping if XML parsing fails completely
-            out["dash_qualities"] = [{"error": "Failed to parse XML manifest"}]
+            out["video"] = {"error": "Failed to parse XML manifest"}
 
     return out
 
@@ -241,7 +231,7 @@ class handler(BaseHTTPRequestHandler):
             self._send_json_response(400, {"error": "Bad Request: Invalid Instagram URL format"})
             return
 
-        # Step 4: Execute fetch and parse routines and send final JSON response to client
+        # Step 4: Execute fetch and parse routines and send final clean JSON response to client
         try:
             raw_payload = fetch_payload(media_id)
             result = parse_payload(raw_payload)
